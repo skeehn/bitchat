@@ -14,13 +14,21 @@ final class MessageDeduplicator {
     private let lock = NSLock()
     private let maxAge: TimeInterval = TransportConfig.messageDedupMaxAgeSeconds  // 5 minutes
     private let maxCount = TransportConfig.messageDedupMaxCount
+    // Performance: Only cleanup every N operations to reduce overhead
+    private var operationsSinceCleanup = 0
+    private let cleanupInterval = 50
 
     /// Check if message is duplicate and add if not
     func isDuplicate(_ messageID: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
 
-        cleanupOldEntries()
+        // Performance: Only cleanup periodically instead of on every call
+        operationsSinceCleanup += 1
+        if operationsSinceCleanup >= cleanupInterval {
+            cleanupOldEntries()
+            operationsSinceCleanup = 0
+        }
 
         if lookup.contains(messageID) {
             return true
@@ -36,8 +44,8 @@ final class MessageDeduplicator {
                 lookup.remove(entries[i].messageID)
             }
             head += removeCount
-            // Periodically compact to reclaim memory
-            if head > entries.count / 2 {
+            // Performance: Use larger threshold for compaction to reduce O(n) operations
+            if head >= 256 && head > entries.count / 2 {
                 entries.removeFirst(head)
                 head = 0
             }
@@ -92,7 +100,8 @@ final class MessageDeduplicator {
             lookup.remove(entries[head].messageID)
             head += 1
         }
-        if head > 0 && head > entries.count / 2 {
+        // Performance: Use larger threshold for compaction
+        if head >= 256 && head > entries.count / 2 {
             entries.removeFirst(head)
             head = 0
         }

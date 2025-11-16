@@ -63,10 +63,23 @@ final class BLEService: NSObject {
         var lastSeen: Date
     }
     private var peers: [PeerID: PeerInfo] = [:]
-    private var currentPeerIDs: [PeerID] {
-        Array(peers.keys)
+    // Performance: Cache peer IDs to avoid repeated array allocations
+    private var cachedPeerIDs: [PeerID] = []
+    private var peerIDsCacheValid = false
+
+    private func getCurrentPeerIDs() -> [PeerID] {
+        if peerIDsCacheValid {
+            return cachedPeerIDs
+        }
+        cachedPeerIDs = Array(peers.keys)
+        peerIDsCacheValid = true
+        return cachedPeerIDs
     }
-    
+
+    private func invalidatePeerIDsCache() {
+        peerIDsCacheValid = false
+    }
+
     // 4. Efficient Message Deduplication
     private let messageDeduplicator = MessageDeduplicator()
     private var selfBroadcastMessageIDs: [String: (id: String, timestamp: Date)] = [:]
@@ -1257,19 +1270,17 @@ final class BLEService: NSObject {
     }
 
     private func handleLeave(_ packet: BitchatPacket, from peerID: PeerID) {
-        _ = collectionsQueue.sync(flags: .barrier) {
-            // Remove the peer when they leave
+        // Performance: Get peer list in same sync block as removal
+        let currentPeerIDs = collectionsQueue.sync(flags: .barrier) { () -> [PeerID] in
             peers.removeValue(forKey: peerID)
+            invalidatePeerIDsCache()
+            return Array(peers.keys)
         }
         // Remove any stored announcement for sync purposes
         gossipSyncManager?.removeAnnouncementForPeer(peerID)
         // Send on main thread
         notifyUI { [weak self] in
             guard let self = self else { return }
-            
-            // Get current peer list (after removal)
-            let currentPeerIDs = self.collectionsQueue.sync { Array(self.peers.keys) }
-            
             self.delegate?.didDisconnectFromPeer(peerID)
             self.delegate?.didUpdatePeerList(currentPeerIDs)
         }
@@ -1748,6 +1759,7 @@ func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeriph
                 if var info = peers[peerID] {
                     info.isConnected = false
                     peers[peerID] = info
+                    invalidatePeerIDsCache()
                 }
             }
             clearDirectLink(with: peerID)

@@ -254,6 +254,7 @@ final class GossipSyncManager {
             return GCSFilter.contains(sortedValues: sorted, candidate: bucket)
         }
 
+        // Performance: Batch packet processing to reduce overhead
         if requestedTypes.contains(.announce) {
             for (_, pair) in latestAnnouncementByPeer {
                 let (idHex, pkt) = pair
@@ -267,33 +268,15 @@ final class GossipSyncManager {
             }
         }
 
-        if requestedTypes.contains(.message) {
-            let toSendMsgs = messages.allPackets(isFresh: isPacketFresh)
-            for pkt in toSendMsgs {
-                let idBytes = PacketIdUtil.computeId(pkt)
-                if !mightContain(idBytes) {
-                    var toSend = pkt
-                    toSend.ttl = 0
-                    delegate?.sendPacket(to: peerID, packet: toSend)
-                }
-            }
-        }
+        // Performance: Process messages, fragments, and files more efficiently
+        let packetGroups: [(SyncType, [BitchatPacket])] = [
+            (.message, requestedTypes.contains(.message) ? messages.allPackets(isFresh: isPacketFresh) : []),
+            (.fragment, requestedTypes.contains(.fragment) ? fragments.allPackets(isFresh: isPacketFresh) : []),
+            (.fileTransfer, requestedTypes.contains(.fileTransfer) ? fileTransfers.allPackets(isFresh: isPacketFresh) : [])
+        ]
 
-        if requestedTypes.contains(.fragment) {
-            let frags = fragments.allPackets(isFresh: isPacketFresh)
-            for pkt in frags {
-                let idBytes = PacketIdUtil.computeId(pkt)
-                if !mightContain(idBytes) {
-                    var toSend = pkt
-                    toSend.ttl = 0
-                    delegate?.sendPacket(to: peerID, packet: toSend)
-                }
-            }
-        }
-
-        if requestedTypes.contains(.fileTransfer) {
-            let files = fileTransfers.allPackets(isFresh: isPacketFresh)
-            for pkt in files {
+        for (_, packets) in packetGroups where !packets.isEmpty {
+            for pkt in packets {
                 let idBytes = PacketIdUtil.computeId(pkt)
                 if !mightContain(idBytes) {
                     var toSend = pkt

@@ -144,19 +144,44 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         contentRefillPerSec: TransportConfig.uiContentRateBucketRefillPerSec
     )
 
+    // Performance: Cache normalized strings to avoid repeated lowercasing
+    private var normalizedSenderKeyCache: [String: String] = [:]
+    private var normalizedContentKeyCache: [String: String] = [:]
+    private let maxCacheSize = 1000
+
     @MainActor
     private func normalizedSenderKey(for message: BitchatMessage) -> String {
         if let spid = message.senderPeerID {
+            let cacheKey = spid.id + (spid.isGeoChat ? ":geo" : spid.isGeoDM ? ":dm" : "")
+            if let cached = normalizedSenderKeyCache[cacheKey] {
+                return cached
+            }
+
+            let result: String
             if spid.isGeoChat || spid.isGeoDM {
                 let full = (nostrKeyMapping[spid] ?? spid.bare).lowercased()
-                return "nostr:" + full
+                result = "nostr:" + full
             } else if spid.id.count == 16, let full = getNoiseKeyForShortID(spid)?.id.lowercased() {
-                return "noise:" + full
+                result = "noise:" + full
             } else {
-                return "mesh:" + spid.id.lowercased()
+                result = "mesh:" + spid.id.lowercased()
             }
+
+            // Trim cache if needed
+            if normalizedSenderKeyCache.count >= maxCacheSize {
+                normalizedSenderKeyCache.removeAll(keepingCapacity: true)
+            }
+            normalizedSenderKeyCache[cacheKey] = result
+            return result
         }
-        return "name:" + message.sender.lowercased()
+
+        let senderKey = "name:" + message.sender
+        if let cached = normalizedSenderKeyCache[senderKey] {
+            return cached
+        }
+        let result = "name:" + message.sender.lowercased()
+        normalizedSenderKeyCache[senderKey] = result
+        return result
     }
 
     private func normalizedContentKey(_ content: String) -> String {
@@ -188,14 +213,18 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     }
 
     // Persistent recent content map (LRU) to speed near-duplicate checks
+    // Performance: Using circular buffer for efficient O(1) operations
     private var contentLRUMap: [String: Date] = [:]
     private var contentLRUOrder: [String] = []
     private var contentLRUHead = 0
     private let contentLRUCap = TransportConfig.contentLRUCap
+
     private func recordContentKey(_ key: String, timestamp: Date) {
-        if contentLRUMap[key] == nil { contentLRUOrder.append(key) }
+        if contentLRUMap[key] == nil {
+            contentLRUOrder.append(key)
+            trimContentLRUIfNeeded()
+        }
         contentLRUMap[key] = timestamp
-        trimContentLRUIfNeeded()
     }
 
     private func trimContentLRUIfNeeded() {
@@ -203,9 +232,23 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         guard activeCount > contentLRUCap else { return }
 
         let overflow = activeCount - contentLRUCap
-        for _ in 0..<overflow {
-            guard let victim = popOldestContentKey() else { break }
-            contentLRUMap.removeValue(forKey: victim)
+        // Batch remove for better performance
+        if overflow > 16 {
+            let removeCount = min(overflow, contentLRUHead + overflow)
+            let keysToRemove = contentLRUOrder[contentLRUHead..<(contentLRUHead + overflow)]
+            keysToRemove.forEach { contentLRUMap.removeValue(forKey: $0) }
+            contentLRUHead += overflow
+        } else {
+            for _ in 0..<overflow {
+                guard let victim = popOldestContentKey() else { break }
+                contentLRUMap.removeValue(forKey: victim)
+            }
+        }
+
+        // Compact less frequently to reduce O(n) operations
+        if contentLRUHead >= 128 && contentLRUHead * 2 >= contentLRUOrder.count {
+            contentLRUOrder.removeFirst(contentLRUHead)
+            contentLRUHead = 0
         }
     }
 
@@ -213,12 +256,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
         guard contentLRUHead < contentLRUOrder.count else { return nil }
         let victim = contentLRUOrder[contentLRUHead]
         contentLRUHead += 1
-
-        // Periodically compact the backing storage to avoid unbounded growth.
-        if contentLRUHead >= 32 && contentLRUHead * 2 >= contentLRUOrder.count {
-            contentLRUOrder.removeFirst(contentLRUHead)
-            contentLRUHead = 0
-        }
         return victim
     }
     // MARK: - Published Properties
@@ -308,6 +345,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     private var selectedPrivateChatFingerprint: String? = nil
     // Map stable short peer IDs (16-hex) to full Noise public key hex (64-hex) for session continuity
     private var shortIDToNoiseKey: [PeerID: PeerID] = [:]
+    // Performance: Reverse index for fast noise key to short ID lookups
+    private var noiseKeyToShortID: [PeerID: PeerID] = [:]
 
     // Resolve full Noise key for a peer's short ID (used by UI header rendering)
     @MainActor
@@ -318,6 +357,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
            let key = meshService.getNoiseService().getPeerPublicKeyData(shortPeerID) {
             let stable = PeerID(hexData: key)
             shortIDToNoiseKey[shortPeerID] = stable
+            noiseKeyToShortID[stable] = shortPeerID // Update reverse index
             return stable
         }
         return nil
@@ -327,14 +367,20 @@ final class ChatViewModel: ObservableObject, BitchatDelegate {
     @MainActor
     func getShortIDForNoiseKey(_ fullNoiseKeyHex: PeerID) -> PeerID {
         guard fullNoiseKeyHex.id.count == 64 else { return fullNoiseKeyHex }
-        // Check known peers for a noise key match
+
+        // Performance: Use reverse index for O(1) lookup
+        if let shortID = noiseKeyToShortID[fullNoiseKeyHex] {
+            return shortID
+        }
+
+        // Fallback: Check known peers for a noise key match
         if let match = allPeers.first(where: { PeerID(hexData: $0.noisePublicKey) == fullNoiseKeyHex }) {
-            return match.peerID
+            let shortID = match.peerID
+            noiseKeyToShortID[fullNoiseKeyHex] = shortID // Cache for next time
+            shortIDToNoiseKey[shortID] = fullNoiseKeyHex
+            return shortID
         }
-        // Also search cache mapping
-        if let pair = shortIDToNoiseKey.first(where: { $0.value == fullNoiseKeyHex }) {
-            return pair.key
-        }
+
         return fullNoiseKeyHex
     }
     private var peerIndex: [PeerID: BitchatPeer] = [:]
